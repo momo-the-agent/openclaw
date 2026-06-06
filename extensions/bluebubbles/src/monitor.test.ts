@@ -305,6 +305,38 @@ describe("BlueBubbles webhook monitor", () => {
       expect(mockDispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalled();
     });
 
+    it("uses the host channel turn runner when available", async () => {
+      const turnRun = vi.fn(
+        async (params: {
+          adapter: {
+            resolveTurn: () => unknown;
+          };
+        }) => {
+          const turn = params.adapter.resolveTurn() as {
+            delivery: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          };
+          await turn.delivery.deliver({ text: "runner reply" }, { kind: "final" });
+        },
+      );
+      const core = createMockRuntime();
+      (core as unknown as { channel: { turn?: { run: typeof turnRun } } }).channel.turn = {
+        run: turnRun,
+      };
+      setupWebhookTarget({ core });
+
+      const payload = createTimestampedNewMessagePayloadForTest({
+        text: "hello from runner host",
+      });
+
+      const res = await dispatchWebhookPayload(payload);
+
+      expect(res.statusCode).toBe(200);
+      expect(turnRun).toHaveBeenCalledTimes(1);
+      expect(mockDispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    });
+
     it("blocks DM from sender not in allowFrom when dmPolicy=allowlist", async () => {
       setupWebhookTarget({
         account: createMockAccount({

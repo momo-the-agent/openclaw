@@ -3,6 +3,10 @@ import {
   resolveTextChunksWithFallback,
   sendMediaWithLeadingCaption,
 } from "openclaw/plugin-sdk/reply-payload";
+import type {
+  GetReplyOptions,
+  ReplyDispatcherWithTypingOptions,
+} from "openclaw/plugin-sdk/reply-runtime";
 import { isPrivateNetworkOptInEnabled } from "openclaw/plugin-sdk/ssrf-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -92,6 +96,31 @@ type PendingOutboundMessageId = {
   isMediaSnippet: boolean;
   createdAt: number;
 };
+
+type BlueBubblesTurnRunner = (params: {
+  channel: "bluebubbles";
+  accountId: string;
+  raw: unknown;
+  adapter: {
+    ingest: () => Record<string, unknown>;
+    resolveTurn: () => Record<string, unknown>;
+  };
+}) => Promise<unknown>;
+
+type BlueBubblesCoreRuntimeWithTurnRunner = {
+  channel?: {
+    turn?: { run?: BlueBubblesTurnRunner };
+    inbound?: { run?: BlueBubblesTurnRunner };
+  };
+};
+
+function resolveBlueBubblesTurnRunner(
+  core: BlueBubblesCoreRuntime,
+): BlueBubblesTurnRunner | undefined {
+  const channel = (core as unknown as BlueBubblesCoreRuntimeWithTurnRunner).channel;
+  const runner = channel?.turn?.run ?? channel?.inbound?.run;
+  return typeof runner === "function" ? runner : undefined;
+}
 
 const pendingOutboundMessageIds: PendingOutboundMessageId[] = [];
 let pendingOutboundMessageIdCounter = 0;
@@ -1472,98 +1501,28 @@ export async function processMessage(
         },
       },
     });
-    await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx: ctxPayload,
-      cfg: config,
-      dispatcherOptions: {
-        ...replyPipeline,
-        deliver: async (payload, info) => {
-          const rawReplyToId =
-            privateApiEnabled && typeof payload.replyToId === "string"
-              ? payload.replyToId.trim()
-              : "";
-          // Resolve short ID (e.g., "5") to full UUID
-          const replyToMessageGuid = rawReplyToId
-            ? resolveBlueBubblesMessageId(rawReplyToId, { requireKnownShortId: true })
-            : "";
-          const mediaList = resolveOutboundMediaUrls(payload);
-          if (mediaList.length > 0) {
-            const tableMode = core.channel.text.resolveMarkdownTableMode({
-              cfg: config,
-              channel: "bluebubbles",
-              accountId: account.accountId,
-            });
-            const text = sanitizeReplyDirectiveText(
-              core.channel.text.convertMarkdownTables(payload.text ?? "", tableMode),
-            );
-            await sendMediaWithLeadingCaption({
-              mediaUrls: mediaList,
-              caption: text,
-              send: async ({ mediaUrl, caption }) => {
-                const cachedBody = (caption ?? "").trim() || "<media:attachment>";
-                const pendingId = rememberPendingOutboundMessageId({
-                  accountId: account.accountId,
-                  sessionKey: route.sessionKey,
-                  outboundTarget,
-                  chatGuid: chatGuidForActions ?? chatGuid,
-                  chatIdentifier,
-                  chatId,
-                  snippet: cachedBody,
-                });
-                let result: Awaited<ReturnType<typeof sendBlueBubblesMedia>>;
-                try {
-                  result = await sendBlueBubblesMedia({
-                    cfg: config,
-                    to: outboundTarget,
-                    mediaUrl,
-                    caption: caption ?? undefined,
-                    replyToId: replyToMessageGuid || null,
-                    accountId: account.accountId,
-                  });
-                } catch (err) {
-                  forgetPendingOutboundMessageId(pendingId);
-                  throw err;
-                }
-                if (maybeEnqueueOutboundMessageId(result.messageId, cachedBody)) {
-                  forgetPendingOutboundMessageId(pendingId);
-                }
-                sentMessage = true;
-                statusSink?.({ lastOutboundAt: Date.now() });
-                if (info.kind === "block") {
-                  restartTypingSoon();
-                }
-              },
-            });
-            return;
-          }
-
-          const textLimit =
-            account.config.textChunkLimit && account.config.textChunkLimit > 0
-              ? account.config.textChunkLimit
-              : DEFAULT_TEXT_LIMIT;
-          const chunkMode = account.config.chunkMode ?? "length";
-          const tableMode = core.channel.text.resolveMarkdownTableMode({
-            cfg: config,
-            channel: "bluebubbles",
-            accountId: account.accountId,
-          });
-          const text = sanitizeReplyDirectiveText(
-            core.channel.text.convertMarkdownTables(payload.text ?? "", tableMode),
-          );
-          const chunks =
-            chunkMode === "newline"
-              ? resolveTextChunksWithFallback(
-                  text,
-                  core.channel.text.chunkTextWithMode(text, textLimit, chunkMode),
-                )
-              : resolveTextChunksWithFallback(
-                  text,
-                  core.channel.text.chunkMarkdownText(text, textLimit),
-                );
-          if (!chunks.length) {
-            return;
-          }
-          for (const chunk of chunks) {
+    const deliver: ReplyDispatcherWithTypingOptions["deliver"] = async (payload, info) => {
+      const rawReplyToId =
+        privateApiEnabled && typeof payload.replyToId === "string" ? payload.replyToId.trim() : "";
+      // Resolve short ID (e.g., "5") to full UUID
+      const replyToMessageGuid = rawReplyToId
+        ? resolveBlueBubblesMessageId(rawReplyToId, { requireKnownShortId: true })
+        : "";
+      const mediaList = resolveOutboundMediaUrls(payload);
+      if (mediaList.length > 0) {
+        const tableMode = core.channel.text.resolveMarkdownTableMode({
+          cfg: config,
+          channel: "bluebubbles",
+          accountId: account.accountId,
+        });
+        const text = sanitizeReplyDirectiveText(
+          core.channel.text.convertMarkdownTables(payload.text ?? "", tableMode),
+        );
+        await sendMediaWithLeadingCaption({
+          mediaUrls: mediaList,
+          caption: text,
+          send: async ({ mediaUrl, caption }) => {
+            const cachedBody = (caption ?? "").trim() || "<media:attachment>";
             const pendingId = rememberPendingOutboundMessageId({
               accountId: account.accountId,
               sessionKey: route.sessionKey,
@@ -1571,20 +1530,23 @@ export async function processMessage(
               chatGuid: chatGuidForActions ?? chatGuid,
               chatIdentifier,
               chatId,
-              snippet: chunk,
+              snippet: cachedBody,
             });
-            let result: Awaited<ReturnType<typeof sendMessageBlueBubbles>>;
+            let result: Awaited<ReturnType<typeof sendBlueBubblesMedia>>;
             try {
-              result = await sendMessageBlueBubbles(outboundTarget, chunk, {
+              result = await sendBlueBubblesMedia({
                 cfg: config,
+                to: outboundTarget,
+                mediaUrl,
+                caption: caption ?? undefined,
+                replyToId: replyToMessageGuid || null,
                 accountId: account.accountId,
-                replyToMessageGuid: replyToMessageGuid || undefined,
               });
             } catch (err) {
               forgetPendingOutboundMessageId(pendingId);
               throw err;
             }
-            if (maybeEnqueueOutboundMessageId(result.messageId, chunk)) {
+            if (maybeEnqueueOutboundMessageId(result.messageId, cachedBody)) {
               forgetPendingOutboundMessageId(pendingId);
             }
             sentMessage = true;
@@ -1592,22 +1554,132 @@ export async function processMessage(
             if (info.kind === "block") {
               restartTypingSoon();
             }
-          }
+          },
+        });
+        return;
+      }
+
+      const textLimit =
+        account.config.textChunkLimit && account.config.textChunkLimit > 0
+          ? account.config.textChunkLimit
+          : DEFAULT_TEXT_LIMIT;
+      const chunkMode = account.config.chunkMode ?? "length";
+      const tableMode = core.channel.text.resolveMarkdownTableMode({
+        cfg: config,
+        channel: "bluebubbles",
+        accountId: account.accountId,
+      });
+      const text = sanitizeReplyDirectiveText(
+        core.channel.text.convertMarkdownTables(payload.text ?? "", tableMode),
+      );
+      const chunks =
+        chunkMode === "newline"
+          ? resolveTextChunksWithFallback(
+              text,
+              core.channel.text.chunkTextWithMode(text, textLimit, chunkMode),
+            )
+          : resolveTextChunksWithFallback(
+              text,
+              core.channel.text.chunkMarkdownText(text, textLimit),
+            );
+      if (!chunks.length) {
+        return;
+      }
+      for (const chunk of chunks) {
+        const pendingId = rememberPendingOutboundMessageId({
+          accountId: account.accountId,
+          sessionKey: route.sessionKey,
+          outboundTarget,
+          chatGuid: chatGuidForActions ?? chatGuid,
+          chatIdentifier,
+          chatId,
+          snippet: chunk,
+        });
+        let result: Awaited<ReturnType<typeof sendMessageBlueBubbles>>;
+        try {
+          result = await sendMessageBlueBubbles(outboundTarget, chunk, {
+            cfg: config,
+            accountId: account.accountId,
+            replyToMessageGuid: replyToMessageGuid || undefined,
+          });
+        } catch (err) {
+          forgetPendingOutboundMessageId(pendingId);
+          throw err;
+        }
+        if (maybeEnqueueOutboundMessageId(result.messageId, chunk)) {
+          forgetPendingOutboundMessageId(pendingId);
+        }
+        sentMessage = true;
+        statusSink?.({ lastOutboundAt: Date.now() });
+        if (info.kind === "block") {
+          restartTypingSoon();
+        }
+      }
+    };
+    const onError: NonNullable<ReplyDispatcherWithTypingOptions["onError"]> = (err, info) => {
+      runtime.error?.(`BlueBubbles ${info.kind} reply failed: ${String(err)}`);
+    };
+    const turnDispatcherOptions = {
+      ...replyPipeline,
+      onReplyStart: typingCallbacks?.onReplyStart,
+      onIdle: typingCallbacks?.onIdle,
+    };
+    const replyOptions: Omit<GetReplyOptions, "onToolResult" | "onBlockReply"> = {
+      onModelSelected,
+      disableBlockStreaming:
+        typeof account.config.blockStreaming === "boolean"
+          ? !account.config.blockStreaming
+          : undefined,
+    };
+    const turnRunner = resolveBlueBubblesTurnRunner(core);
+    if (turnRunner) {
+      await turnRunner({
+        channel: "bluebubbles",
+        accountId: account.accountId,
+        raw: ctxPayload,
+        adapter: {
+          ingest: () => ({
+            id: String(ctxPayload.MessageSid ?? message.messageId),
+            timestamp: message.timestamp,
+            rawText: rawBody,
+            textForAgent: rawBody,
+            textForCommands: commandBody,
+            raw: ctxPayload,
+          }),
+          resolveTurn: () => ({
+            cfg: config,
+            channel: "bluebubbles",
+            accountId: account.accountId,
+            agentId: route.agentId,
+            routeSessionKey: route.sessionKey,
+            storePath,
+            ctxPayload,
+            recordInboundSession: core.channel.session.recordInboundSession,
+            dispatchReplyWithBufferedBlockDispatcher:
+              core.channel.reply.dispatchReplyWithBufferedBlockDispatcher,
+            delivery: { deliver, onError },
+            dispatcherOptions: turnDispatcherOptions,
+            replyOptions,
+            record: {
+              onRecordError: (err: unknown) => {
+                runtime.error?.(`[bluebubbles] failed updating session meta: ${String(err)}`);
+              },
+            },
+          }),
         },
-        onReplyStart: typingCallbacks?.onReplyStart,
-        onIdle: typingCallbacks?.onIdle,
-        onError: (err, info) => {
-          runtime.error?.(`BlueBubbles ${info.kind} reply failed: ${String(err)}`);
+      });
+    } else {
+      await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx: ctxPayload,
+        cfg: config,
+        dispatcherOptions: {
+          ...turnDispatcherOptions,
+          deliver,
+          onError,
         },
-      },
-      replyOptions: {
-        onModelSelected,
-        disableBlockStreaming:
-          typeof account.config.blockStreaming === "boolean"
-            ? !account.config.blockStreaming
-            : undefined,
-      },
-    });
+        replyOptions,
+      });
+    }
   } finally {
     const shouldStopTyping =
       Boolean(chatGuidForActions && baseUrl && password) && (streamingActive || !sentMessage);
